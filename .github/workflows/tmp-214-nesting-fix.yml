@@ -1,0 +1,130 @@
+name: Temporary PR214 nesting proof
+
+on:
+  push:
+    branches:
+      - wip/214-review3-hostile-path-matrix
+    paths:
+      - .github/workflows/tmp-214-nesting-fix.yml
+      - agentguard/traces/execution.py
+      - tests/unit/test_execution_trace_rejection_paths.py
+
+permissions:
+  contents: write
+
+jobs:
+  prove:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out proof branch
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: wip/214-review3-hostile-path-matrix
+          persist-credentials: true
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Apply deterministic pre-parse nesting guard
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("agentguard/traces/execution.py")
+          text = path.read_text(encoding="utf-8")
+          if "def _validate_json_nesting(" not in text:
+              marker = "\ndef load_execution_trace(path: Path) -> ExecutionTrace:\n"
+              helper = r'''
+
+def _validate_json_nesting(line: str) -> None:
+    """Enforce the trace nesting budget before interpreter JSON recursion differs."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for char in line:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "[{":
+            depth += 1
+            # _validate_bounds() counts the parsed root at depth zero, so the
+            # lexical representation may contain the root container plus
+            # MAX_TRACE_NESTING nested containers without changing the
+            # existing valid-trace boundary.
+            if depth > MAX_TRACE_NESTING + 1:
+                raise ValueError(
+                    f"Trace JSON exceeds the {MAX_TRACE_NESTING}-level nesting limit."
+                )
+        elif char in "]}" and depth:
+            depth -= 1
+'''
+              if marker not in text:
+                  raise SystemExit("load_execution_trace marker not found")
+              text = text.replace(marker, helper + marker, 1)
+
+          old = '''                try:\n                    record = json.loads(line)\n                except (json.JSONDecodeError, RecursionError) as error:\n                    raise ValueError(\n                        f"Invalid trace JSON on line {line_number}: {error}"\n                    ) from error\n'''
+          new = '''                try:\n                    _validate_json_nesting(line)\n                    record = json.loads(line)\n                except (json.JSONDecodeError, RecursionError, ValueError) as error:\n                    raise ValueError(\n                        f"Invalid trace JSON on line {line_number}: {error}"\n                    ) from error\n'''
+          if old in text:
+              text = text.replace(old, new, 1)
+          elif "_validate_json_nesting(line)" not in text:
+              raise SystemExit("json.loads block not found")
+          path.write_text(text, encoding="utf-8")
+
+          tests = Path("tests/unit/test_execution_trace_rejection_paths.py")
+          test_text = tests.read_text(encoding="utf-8")
+          if "test_json_nesting_preflight_ignores_delimiters_inside_strings" not in test_text:
+              test_text += r'''
+
+
+def test_json_nesting_preflight_ignores_delimiters_inside_strings() -> None:
+    trace_module._validate_json_nesting(
+        '{"record_type":"header","marker":"' + "[" * 1000 + "}" * 1000 + '"}'
+    )
+
+
+def test_json_nesting_preflight_rejects_excess_depth_deterministically() -> None:
+    depth = trace_module.MAX_TRACE_NESTING + 2
+    with pytest.raises(ValueError, match="nesting limit"):
+        trace_module._validate_json_nesting("[" * depth + "]" * depth)
+'''
+              tests.write_text(test_text, encoding="utf-8")
+          PY
+
+      - name: Install project and development dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Run focused hostile and replay proof on Python 3.12
+        run: |
+          python -m pytest -q \
+            tests/unit/test_execution_trace.py \
+            tests/unit/test_trace_replay.py \
+            tests/unit/test_execution_trace_rejection_paths.py
+
+      - name: Run Ruff on changed proof surface
+        run: |
+          python -m ruff check \
+            agentguard/traces/execution.py \
+            tests/unit/test_execution_trace_rejection_paths.py
+
+      - name: Commit proven loader and regression only
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add agentguard/traces/execution.py tests/unit/test_execution_trace_rejection_paths.py
+          if git diff --cached --quiet; then
+            echo "Proof surface already committed."
+            exit 0
+          fi
+          git commit -m "fix(trace): enforce JSON nesting before interpreter parsing"
+          git push origin HEAD:wip/214-review3-hostile-path-matrix
