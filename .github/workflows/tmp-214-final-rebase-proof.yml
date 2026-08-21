@@ -33,6 +33,9 @@ jobs:
         working-directory: target
         run: |
           set -euo pipefail
+          test "$(git rev-parse HEAD)" = "82bca309477d3c4093db96e86433711477e04803"
+          git config user.name "Nickgonzales76017"
+          git config user.email "45552585+Nickgonzales76017@users.noreply.github.com"
           git remote add upstream https://github.com/richinmrudul/agentguard.git || true
           git fetch upstream main
           test "$(git rev-parse upstream/main)" = "0449e7d059e4990458462ada83c0237dc8e57c72"
